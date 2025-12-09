@@ -7,6 +7,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "driver/gpio.h"
 
 #include "mqtt_client.h"
 
@@ -20,13 +21,29 @@ static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
 static int isConnected = 0;
 
-// static esp_mqtt_client_handle_t mqttClient;
-
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
 #define TOPIC              "esp32/test"
 #define URL                "mqtt://test.mosquitto.org:1883"
+
+// GPIO Configuration
+#define OUTPUT_PIN         (GPIO_NUM_2)  // Change to your desired pin
+
+static void configure_gpio(void)
+{
+    // Configure GPIO as output
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << OUTPUT_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+    gpio_set_level(OUTPUT_PIN, 0);  // Start with LOW
+    
+}
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data)
@@ -95,7 +112,6 @@ static void mqtt_start(void)
     };
 
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
-    // mqttClient = client;
     esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     esp_mqtt_client_start(client);
 }
@@ -194,7 +210,7 @@ void app_main(void)
     if (isConnected) {
         mqtt_start();
     };
-    while (true) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+
+    configure_gpio();
+    gpio_set_level(OUTPUT_PIN, 1);
 }
