@@ -1,4 +1,5 @@
 #include <string.h>
+#include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -14,12 +15,15 @@
 // WiFi credentials
 #define WIFI_SSID      "kbk"
 #define WIFI_PASS      "keiyobend1521"
-#define MAXIMUM_RETRY  5
+#define MAXIMUM_RETRY  10
 
 static const char *TAG = "WiFi";
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
 static int isConnected = 0;
+
+static int blink_freq_hz = 0;
+static bool led_on = false;
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
@@ -43,6 +47,47 @@ static void configure_gpio(void)
     gpio_config(&io_conf);
     gpio_set_level(OUTPUT_PIN, 0);  // Start with LOW
     
+}
+
+static void handle_mqtt_payload(const char *data, int len)
+{
+    char buf[64];
+
+    int copy_len = len < sizeof(buf) - 1 ? len : sizeof(buf);
+    memcpy(buf, data, copy_len);
+    buf[copy_len] = '\0';
+
+    for (int i = 0; i < copy_len; i++) {
+        buf[i] = toupper((unsigned char)buf[i]);
+    }
+
+    if (strcmp(buf, "ON") == 0) {
+        ESP_LOGI(TAG, "Command: ON");
+        // gpio_set_level(OUTPUT_PIN, 1);
+        led_on = true;
+        blink_freq_hz = 0;
+        return;
+    }
+
+    if (strcmp(buf, "OFF") == 0) {
+        ESP_LOGI(TAG, "Command: OFF");
+        // gpio_set_level(OUTPUT_PIN, 0);
+        led_on = false;
+        blink_freq_hz = 0;
+        return;
+    }
+
+    char *endptr = NULL;
+    long val = strtol(buf, &endptr, 10);
+
+    if (endptr != buf && *endptr == '\0' && val > 0) {
+        ESP_LOGI("MQTT", "Positive number: %ld", val);
+        blink_freq_hz = val;
+        led_on = true;
+        return;
+    }
+
+    ESP_LOGI(TAG, "Unknown payload: '%s'", buf);
 }
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
@@ -78,8 +123,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         
     case MQTT_EVENT_DATA:
         ESP_LOGI(TAG, "MQTT_EVENT_DATA");
-        printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
-        printf("DATA=%.*s\r\n", event->data_len, event->data);
+        // printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
+        // printf("DATA=%.*s\r\n", event->data_len, event->data);
+        handle_mqtt_payload(event->data, event->data_len);
         break;
         
     case MQTT_EVENT_ERROR:
@@ -194,8 +240,30 @@ void wifi_init_sta(void)
     }
 }
 
+static void blink_task(void *arg)
+{
+    while (1) {
+        if (blink_freq_hz > 0 && led_on) {
+            gpio_set_level(OUTPUT_PIN, 1);
+            vTaskDelay(pdMS_TO_TICKS(blink_freq_hz));
+            gpio_set_level(OUTPUT_PIN, 0);
+            vTaskDelay(pdMS_TO_TICKS(blink_freq_hz));
+        } else if (led_on) {
+            // Solid ON
+            gpio_set_level(OUTPUT_PIN, 1);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        } else {
+            // OFF
+            gpio_set_level(OUTPUT_PIN, 0);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+}
+
+
 void app_main(void)
 {
+ 
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -209,8 +277,7 @@ void app_main(void)
 
     if (isConnected) {
         mqtt_start();
+        configure_gpio();
+        xTaskCreate(blink_task, "blink_task", 2048, NULL, 5, NULL);
     };
-
-    configure_gpio();
-    gpio_set_level(OUTPUT_PIN, 1);
 }
