@@ -1,0 +1,18 @@
+dependencies:
+  chiehmin/scd41:
+    component_hash: f213e9a556c2a84b4245f33491aea5a0022b4a76f1b9fc9f4703c0abb711b22a
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.0.0
+  idf:
+    source:
+      type: idf
+    version: 5.5.1
+direct_dependencies:
+- chiehmin/scd41
+- idf
+manifest_hash: 863b0d299341764946018f4ac78a8f8322440f154a9d042a3ef509ec738d9649
+target: esp32c3
+version: 2.0.0

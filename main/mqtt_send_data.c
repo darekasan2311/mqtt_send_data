@@ -1,14 +1,19 @@
+#include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
-#include "driver/gpio.h"
+
+#include "scd41.h"
+#include "driver/i2c_master.h"
 
 #include "mqtt_client.h"
 
@@ -17,13 +22,16 @@
 #define WIFI_PASS      "keiyobend1521"
 #define MAXIMUM_RETRY  10
 
+#define I2C_MASTER_SCL_IO 7
+#define I2C_MASTER_SDA_IO 6
+#define I2C_MASTER_FREQ_HZ 100000
+
 static const char *TAG = "WiFi";
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
 static int isConnected = 0;
 
-static int blink_freq_hz = 0;
-static bool led_on = false;
+static esp_mqtt_client_handle_t mqtt_client = NULL;
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
@@ -31,64 +39,6 @@ static bool led_on = false;
 #define TOPIC              "esp32/test"
 #define URL                "mqtt://test.mosquitto.org:1883"
 
-// GPIO Configuration
-#define OUTPUT_PIN         (GPIO_NUM_2)  // Change to your desired pin
-
-static void configure_gpio(void)
-{
-    // Configure GPIO as output
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << OUTPUT_PIN),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io_conf);
-    gpio_set_level(OUTPUT_PIN, 0);  // Start with LOW
-    
-}
-
-static void handle_mqtt_payload(const char *data, int len)
-{
-    char buf[64];
-
-    int copy_len = len < sizeof(buf) - 1 ? len : sizeof(buf);
-    memcpy(buf, data, copy_len);
-    buf[copy_len] = '\0';
-
-    for (int i = 0; i < copy_len; i++) {
-        buf[i] = toupper((unsigned char)buf[i]);
-    }
-
-    if (strcmp(buf, "ON") == 0) {
-        ESP_LOGI(TAG, "Command: ON");
-        // gpio_set_level(OUTPUT_PIN, 1);
-        led_on = true;
-        blink_freq_hz = 0;
-        return;
-    }
-
-    if (strcmp(buf, "OFF") == 0) {
-        ESP_LOGI(TAG, "Command: OFF");
-        // gpio_set_level(OUTPUT_PIN, 0);
-        led_on = false;
-        blink_freq_hz = 0;
-        return;
-    }
-
-    char *endptr = NULL;
-    long val = strtol(buf, &endptr, 10);
-
-    if (endptr != buf && *endptr == '\0' && val > 0) {
-        ESP_LOGI("MQTT", "Positive number: %ld", val);
-        blink_freq_hz = val;
-        led_on = true;
-        return;
-    }
-
-    ESP_LOGI(TAG, "Unknown payload: '%s'", buf);
-}
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data)
@@ -125,7 +75,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         ESP_LOGI(TAG, "MQTT_EVENT_DATA");
         // printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
         // printf("DATA=%.*s\r\n", event->data_len, event->data);
-        handle_mqtt_payload(event->data, event->data_len);
         break;
         
     case MQTT_EVENT_ERROR:
@@ -149,7 +98,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 }
 
 
-static void mqtt_start(void)
+esp_mqtt_client_handle_t mqtt_start(void)
 {
     const esp_mqtt_client_config_t mqtt_cfg = {
         .broker = {
@@ -160,6 +109,8 @@ static void mqtt_start(void)
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     esp_mqtt_client_start(client);
+
+    return client;
 }
 
 
@@ -240,26 +191,83 @@ void wifi_init_sta(void)
     }
 }
 
-static void blink_task(void *arg)
+void mqtt_publish_data(const char *topic, const char *data)
 {
-    while (1) {
-        if (blink_freq_hz > 0 && led_on) {
-            gpio_set_level(OUTPUT_PIN, 1);
-            vTaskDelay(pdMS_TO_TICKS(blink_freq_hz));
-            gpio_set_level(OUTPUT_PIN, 0);
-            vTaskDelay(pdMS_TO_TICKS(blink_freq_hz));
-        } else if (led_on) {
-            // Solid ON
-            gpio_set_level(OUTPUT_PIN, 1);
-            vTaskDelay(pdMS_TO_TICKS(100));
-        } else {
-            // OFF
-            gpio_set_level(OUTPUT_PIN, 0);
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
+    if (mqtt_client == NULL) {
+        ESP_LOGE(TAG, "MQTT client not initialized");
+        return;
+    }
+    
+    int msg_id = esp_mqtt_client_publish(mqtt_client, topic, data, 0, 1, 0);
+    
+    if (msg_id == -1) {
+        ESP_LOGE(TAG, "Failed to publish message");
+    } else {
+        ESP_LOGI(TAG, "Published to %s: %s (msg_id=%d)", topic, data, msg_id);
     }
 }
 
+void mqtt_publish_task(void *pvParameters)
+{
+    char json_data[128];
+    
+    while (1) {
+        scd41_data_t data;
+        esp_err_t ret = scd41_read_measurement(&data);
+        
+        if (ret == ESP_OK && data.data_ready) {
+            ESP_LOGI(TAG, "CO2: %d ppm, Temperature: %.1f°C, Humidity: %.1f%%",
+                     data.co2_ppm, data.temperature, data.humidity);
+            
+            // Format sensor data as JSON
+            snprintf(json_data, sizeof(json_data), 
+                     "{\"co2\":%d,\"temperature\":%.1f,\"humidity\":%.1f}",
+                     data.co2_ppm, data.temperature, data.humidity);
+            
+            // Publish to MQTT topic
+            mqtt_publish_data(TOPIC, json_data);
+            
+        } else {
+            ESP_LOGW(TAG, "Failed to read sensor data");
+        }
+        
+        // SCD41 provides new data every 5 seconds
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+void start_periodic_publishing_task(uint32_t period_ms)
+{
+    static uint32_t period = 0;
+    period = period_ms;
+    
+    xTaskCreate(mqtt_publish_task, "mqtt_publish", 4096, &period, 5, NULL);
+    ESP_LOGI(TAG, "Periodic publishing task started (period: %lu ms)", period_ms);
+}
+
+static void init_scd41(void)
+{
+    // Configure I2C master (you need to do this before using the component)
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,                // GPIO pin for SDA
+        .scl_io_num = I2C_MASTER_SCL_IO,                // GPIO pin for SCL
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,      // 100kHz
+    };
+    ESP_ERROR_CHECK(i2c_param_config(I2C_NUM_0, &conf));
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0));
+
+    // Initialize SCD41
+    scd41_config_t config = SCD41_CONFIG_DEFAULT();
+    config.i2c_port = I2C_NUM_0;
+    config.timeout_ms = 1000;
+
+    ESP_ERROR_CHECK(scd41_init(&config));
+    ESP_ERROR_CHECK(scd41_start_measurement());
+
+}
 
 void app_main(void)
 {
@@ -275,9 +283,11 @@ void app_main(void)
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     wifi_init_sta();
 
+    init_scd41();
+
     if (isConnected) {
-        mqtt_start();
-        configure_gpio();
-        xTaskCreate(blink_task, "blink_task", 2048, NULL, 5, NULL);
+        mqtt_client = mqtt_start();
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        start_periodic_publishing_task(5000);
     };
 }
